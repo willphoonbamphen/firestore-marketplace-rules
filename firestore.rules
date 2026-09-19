@@ -1,0 +1,135 @@
+rules_version = '2';
+
+// Two-sided services marketplace: customers post jobs, approved providers accept
+// them, admins moderate. The client is never trusted with anything that decides
+// who may do what: roles come from an auth custom claim, provider approval and
+// the job status machine are enforced here, and the audit log is write-once.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+    function signedIn() {
+      return request.auth != null;
+    }
+    function isOwner(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+    // Set server-side only (Admin SDK: setCustomUserClaims). Never a client field.
+    function isAdmin() {
+      return signedIn() && request.auth.token.admin == true;
+    }
+    // The write may touch these keys and no others.
+    function onlyChanges(keys) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys);
+    }
+    function text(value, max) {
+      return value is string && value.size() > 0 && value.size() <= max;
+    }
+    function providerApproved(uid) {
+      return exists(/databases/$(database)/documents/providers/$(uid))
+        && get(/databases/$(database)/documents/providers/$(uid)).data.status == 'approved';
+    }
+
+    // ---------- users: private profile, no role field ----------
+    match /users/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+      allow create: if isOwner(uid)
+        && request.resource.data.keys().hasOnly(['displayName', 'phone', 'createdAt'])
+        && text(request.resource.data.displayName, 80)
+        && request.resource.data.createdAt == request.time;
+      allow update: if isOwner(uid)
+        && onlyChanges(['displayName', 'phone'])
+        && text(request.resource.data.displayName, 80);
+      allow delete: if false;
+    }
+
+    // ---------- providers: applicants start 'pending', only an admin approves ----------
+    match /providers/{uid} {
+      // Queries must filter on status == 'approved' to list other people's profiles.
+      allow read: if signedIn() && (isOwner(uid) || isAdmin() || resource.data.status == 'approved');
+      allow create: if isOwner(uid)
+        && request.resource.data.keys().hasOnly(['bio', 'categories', 'status', 'createdAt'])
+        && request.resource.data.status == 'pending'
+        && text(request.resource.data.bio, 500)
+        && request.resource.data.categories is list
+        && request.resource.data.categories.size() <= 10
+        && request.resource.data.createdAt == request.time;
+      allow update: if
+        (isOwner(uid) && onlyChanges(['bio', 'categories']) && text(request.resource.data.bio, 500))
+        || (isAdmin() && onlyChanges(['status'])
+            && request.resource.data.status in ['approved', 'suspended', 'pending']);
+      allow delete: if false;
+    }
+
+    // ---------- jobs: a small state machine, open -> accepted -> completed | cancelled ----------
+    match /jobs/{jobId} {
+      allow read: if signedIn() && (
+        resource.data.customerId == request.auth.uid
+        || resource.data.providerId == request.auth.uid
+        || isAdmin());
+
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(
+             ['customerId', 'title', 'description', 'category', 'status', 'providerId', 'createdAt'])
+        && request.resource.data.customerId == request.auth.uid
+        && request.resource.data.status == 'open'
+        && request.resource.data.providerId == null
+        && text(request.resource.data.title, 120)
+        && text(request.resource.data.description, 2000)
+        && request.resource.data.createdAt == request.time;
+
+      allow update: if signedIn() && (
+        // customer cancels a job that has not been completed
+        (resource.data.customerId == request.auth.uid
+          && resource.data.status in ['open', 'accepted']
+          && onlyChanges(['status'])
+          && request.resource.data.status == 'cancelled')
+        // an approved provider claims an open job. Firestore evaluates this against the
+        // stored document, so of two racing providers the second write is rejected.
+        || (resource.data.status == 'open'
+          && resource.data.customerId != request.auth.uid
+          && onlyChanges(['status', 'providerId'])
+          && request.resource.data.status == 'accepted'
+          && request.resource.data.providerId == request.auth.uid
+          && providerApproved(request.auth.uid))
+        // only the assigned provider can finish it
+        || (resource.data.providerId == request.auth.uid
+          && resource.data.status == 'accepted'
+          && onlyChanges(['status'])
+          && request.resource.data.status == 'completed'));
+
+      allow delete: if false;
+
+      // ---------- messages: participants only, immutable ----------
+      match /messages/{messageId} {
+        function participant() {
+          let job = get(/databases/$(database)/documents/jobs/$(jobId)).data;
+          return signedIn() && (job.customerId == request.auth.uid || job.providerId == request.auth.uid);
+        }
+        allow read: if participant();
+        allow create: if participant()
+          && request.resource.data.keys().hasOnly(['senderId', 'text', 'createdAt'])
+          && request.resource.data.senderId == request.auth.uid
+          && text(request.resource.data.text, 1000)
+          && request.resource.data.createdAt == request.time;
+        allow update, delete: if false;
+      }
+    }
+
+    // ---------- audit log: admins append, nobody edits or deletes ----------
+    match /auditLog/{entryId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin()
+        && request.resource.data.keys().hasOnly(['actorId', 'action', 'targetId', 'at'])
+        && request.resource.data.actorId == request.auth.uid
+        && text(request.resource.data.action, 60)
+        && request.resource.data.at == request.time;
+      allow update, delete: if false;
+    }
+
+    // Everything else is closed.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

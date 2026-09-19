@@ -1,0 +1,15 @@
+{
+  "name": "firestore-marketplace-rules",
+  "version": "1.0.0",
+  "description": "Tested Firestore security rules for a two-sided services marketplace (customers, providers, admins).",
+  "private": false,
+  "license": "MIT",
+  "scripts": {
+    "test": "firebase emulators:exec --only firestore --project demo-marketplace \"node --test test/\""
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "^3.0.4",
+    "firebase": "^10.14.1",
+    "firebase-tools": "^13.0.0"
+  }
+}
